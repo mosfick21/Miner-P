@@ -42,7 +42,9 @@ TARGET_BATCH_SECONDS = 0.45
 THREADS = 256
 
 CUDA_SOURCE = r"""
-#include <stdint.h>
+// NVRTC environments such as Kaggle may not expose host C headers.
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
 __device__ __constant__ uint32_t K[64]={
 0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
 0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
