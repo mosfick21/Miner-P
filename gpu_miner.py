@@ -10,6 +10,7 @@ import secrets
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,12 +37,11 @@ TOTAL_SUPPLY = "0x18160ddd"
 MINT_PRICE = "0x6817c76c"
 CHALLENGE = "0xd2ef7398"
 DIFFICULTY = "0x5c062d6c"
-LAST_MINT_AT = "0xda444f0b"
 MINE = "0xe43e322c"  # mine(uint256,bytes32)
-MINT_INTERVAL_SECONDS = 15
-POLL_SECONDS = 0.75
-TARGET_BATCH_SECONDS = 0.45
+POLL_SECONDS = 0.20
+TARGET_BATCH_SECONDS = 0.18
 THREADS = 256
+MINE_GAS_LIMIT = 160_000
 
 CUDA_SOURCE = r"""
 // NVRTC environments such as Kaggle may not expose host C headers.
@@ -103,10 +103,6 @@ class RpcRejected(RpcError):
     """A valid JSON-RPC response rejected the call; retrying cannot fix it."""
 
 
-class GateClosed(RpcError):
-    pass
-
-
 class RpcPool:
     def __init__(self, urls: list[str]):
         self.urls = list(dict.fromkeys(urls)); self.index = 0; self.ident = 0
@@ -147,15 +143,33 @@ class RpcPool:
                 error=exc;time.sleep(min(.15*(attempt+1),.75))
         raise RpcError(f"RPC batch failed: {error}")
 
+    def broadcast(self, raw_tx: str, expected_hash: str) -> str:
+        def send(url: str) -> tuple[str, str]:
+            session=requests.Session();payload={"jsonrpc":"2.0","id":int(time.time_ns()%2_000_000_000),"method":"eth_sendRawTransaction","params":[raw_tx]}
+            response=session.post(url,json=payload,timeout=12);response.raise_for_status();body=response.json()
+            if body.get("result"):return "ok",body["result"]
+            return "error",body.get("error",{}).get("message",str(body.get("error")))
+        errors=[]
+        with ThreadPoolExecutor(max_workers=len(self.urls)) as pool:
+            futures=[pool.submit(send,url) for url in self.urls]
+            for future in as_completed(futures):
+                try:
+                    status,value=future.result()
+                    if status=="ok":return value
+                    errors.append(value)
+                except Exception as exc:errors.append(str(exc))
+        if any("already known" in x.lower() or "nonce too low" in x.lower() for x in errors):return expected_hash
+        raise RpcError("broadcast failed: "+" | ".join(errors))
+
 
 @dataclass(frozen=True)
 class Config:
     chain_id: int; chain_name: str; rpc_urls: list[str]; contract: str; source: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class Job:
-    supply: int; price: int; challenge: str; difficulty: int; last_mint_at: int; chain_offset: float
+    supply: int; price: int; challenge: str; difficulty: int; tx_nonce: int; gas_price: int; base_fee: int|None; balance: int
 
 
 def discover() -> Config:
@@ -182,16 +196,22 @@ def as_int(raw: str) -> int:
     return int(raw,16)
 
 
-def state(rpc: RpcPool, contract: str) -> Job:
-    supply,price,challenge,difficulty,last_mint,block=rpc.batch([call(contract,TOTAL_SUPPLY),call(contract,MINT_PRICE),call(contract,CHALLENGE),call(contract,DIFFICULTY),call(contract,LAST_MINT_AT),("eth_getBlockByNumber",["latest",False])])
+def state(rpc: RpcPool, contract: str, address: str) -> Job:
+    supply,price,challenge,difficulty,tx_nonce,gas_price,block,balance=rpc.batch([call(contract,TOTAL_SUPPLY),call(contract,MINT_PRICE),call(contract,CHALLENGE),call(contract,DIFFICULTY),("eth_getTransactionCount",[address,"pending"]),("eth_gasPrice",[]),("eth_getBlockByNumber",["latest",False]),("eth_getBalance",[address,"latest"])])
     if not re.fullmatch(r"0x[0-9a-fA-F]{64}",challenge or ""):raise RpcError("invalid challenge")
-    chain_time=int(block["timestamp"],16)
-    return Job(as_int(supply),as_int(price),challenge.lower(),as_int(difficulty),as_int(last_mint),chain_time-time.time())
+    rawbase=block.get("baseFeePerGas")
+    return Job(as_int(supply),as_int(price),challenge.lower(),as_int(difficulty),as_int(tx_nonce),as_int(gas_price),int(rawbase,16) if rawbase is not None else None,as_int(balance))
 
 
 def fresh(rpc: RpcPool, contract: str) -> tuple[str,int]:
     challenge,difficulty=rpc.batch([call(contract,CHALLENGE),call(contract,DIFFICULTY)])
     return challenge.lower(),as_int(difficulty)
+
+
+def monitor(rpc: RpcPool, contract: str, address: str) -> tuple[str,int,int,int,int|None,int]:
+    challenge,difficulty,tx_nonce,gas_price,block,balance=rpc.batch([call(contract,CHALLENGE),call(contract,DIFFICULTY),("eth_getTransactionCount",[address,"pending"]),("eth_gasPrice",[]),("eth_getBlockByNumber",["latest",False]),("eth_getBalance",[address,"latest"])])
+    rawbase=block.get("baseFeePerGas")
+    return challenge.lower(),as_int(difficulty),as_int(tx_nonce),as_int(gas_price),int(rawbase,16) if rawbase is not None else None,as_int(balance)
 
 
 def digest(address: str, nonce: int, challenge: str) -> bytes:
@@ -231,34 +251,42 @@ class GPU:
         if zero_bits(digest(address,nonce,challenge))<30:raise RuntimeError("on-chain proof self-test failed")
 
     def mine(self,address: str,job: Job,rpc: RpcPool,contract: str,ui: "UI",session: int) -> tuple[str,int|None,int]:
-        base=cp.asarray(words(address,job.challenge));start=secrets.randbits(64);offset=0;count=0;rate=0.;best=0;besthash="—";last_poll=0.
-        while True:
-            self.found.fill(0);self.answer.fill(0);self.best.fill(0);self.bestnonce.fill(0)
-            first=(start+offset)&((1<<64)-1);hashes=self.blocks*THREADS*self.iters;began=time.perf_counter()
-            self.kernel((self.blocks,),(THREADS,),(base,np.uint32(first & 0xFFFFFFFF),np.uint32((first >> 32) & 0xFFFFFFFF),np.uint32(self.iters),np.uint32(job.difficulty),self.found,self.answer,self.best,self.bestnonce));cp.cuda.Stream.null.synchronize();elapsed=max(time.perf_counter()-began,.001)
-            hit=int(cp.asnumpy(self.found)[0]);nonce=int(cp.asnumpy(self.answer)[0]);batchbest=int(cp.asnumpy(self.best)[0]);bn=int(cp.asnumpy(self.bestnonce)[0]);instant=hashes/elapsed;rate=instant if not rate else rate*.72+instant*.28;count+=hashes;offset=(offset+hashes)&((1<<64)-1)
-            if batchbest>best:
-                value=digest(address,bn,job.challenge);bits=zero_bits(value)
-                if bits>=best:best=bits;besthash="0x"+value.hex()
-            ui.data.update(phase="MINING",rate=rate,job_hashes=count,session_hashes=session+count,best=best,besthash=besthash,batch_ms=elapsed*1000,iters=self.iters);ui.refresh()
-            factor=min(1.45,max(.70,TARGET_BATCH_SECONDS/elapsed));self.iters=max(16,min(16384,int(self.iters*factor)))
-            if hit:
-                if zero_bits(digest(address,nonce,job.challenge))<job.difficulty:raise RuntimeError("GPU nonce failed CPU verification")
-                return "found",nonce,count
-            if time.monotonic()-last_poll>=POLL_SECONDS:
-                last_poll=time.monotonic()
-                try:
-                    challenge,difficulty=fresh(rpc,contract)
-                    if challenge!=job.challenge or difficulty!=job.difficulty:return "stale",None,count
-                except Exception as exc:ui.log(f"RPC monitor retry: {exc}","yellow")
+        base=cp.asarray(words(address,job.challenge));start=secrets.randbits(64);offset=0;count=0;rate=0.;best=0;besthash="-";next_poll=0.;probe=None
+        watcher=ThreadPoolExecutor(max_workers=1);watch_rpc=RpcPool(rpc.urls)
+        try:
+            while True:
+                now=time.monotonic()
+                if probe is None and now>=next_poll:
+                    probe=watcher.submit(monitor,watch_rpc,contract,address);next_poll=now+POLL_SECONDS
+                self.found.fill(0);self.answer.fill(0);self.best.fill(0);self.bestnonce.fill(0)
+                first=(start+offset)&((1<<64)-1);hashes=self.blocks*THREADS*self.iters;began=time.perf_counter()
+                self.kernel((self.blocks,),(THREADS,),(base,np.uint32(first & 0xFFFFFFFF),np.uint32((first >> 32) & 0xFFFFFFFF),np.uint32(self.iters),np.uint32(job.difficulty),self.found,self.answer,self.best,self.bestnonce));cp.cuda.Stream.null.synchronize();elapsed=max(time.perf_counter()-began,.001)
+                hit=int(cp.asnumpy(self.found)[0]);nonce=int(cp.asnumpy(self.answer)[0]);batchbest=int(cp.asnumpy(self.best)[0]);bn=int(cp.asnumpy(self.bestnonce)[0]);instant=hashes/elapsed;rate=instant if not rate else rate*.72+instant*.28;count+=hashes;offset=(offset+hashes)&((1<<64)-1)
+                if batchbest>best:
+                    value=digest(address,bn,job.challenge);bits=zero_bits(value)
+                    if bits>=best:best=bits;besthash="0x"+value.hex()
+                ui.data.update(phase="MINING",rate=rate,job_hashes=count,session_hashes=session+count,best=best,besthash=besthash,batch_ms=elapsed*1000,iters=self.iters);ui.refresh()
+                factor=min(1.45,max(.70,TARGET_BATCH_SECONDS/elapsed));self.iters=max(16,min(16384,int(self.iters*factor)))
+                if probe is not None and probe.done():
+                    try:
+                        challenge,difficulty,tx_nonce,gas_price,base_fee,balance=probe.result()
+                        if challenge!=job.challenge or difficulty!=job.difficulty:return "stale",None,count
+                        job.tx_nonce=tx_nonce;job.gas_price=gas_price;job.base_fee=base_fee;job.balance=balance
+                    except Exception as exc:ui.log(f"RPC monitor retry: {exc}","yellow")
+                    probe=None
+                if hit:
+                    if zero_bits(digest(address,nonce,job.challenge))<job.difficulty:raise RuntimeError("GPU nonce failed CPU verification")
+                    return "found",nonce,count
+        finally:
+            watcher.shutdown(wait=False,cancel_futures=True)
 
 
 class UI:
     def __init__(self,config: Config,address: str,gpu: str):
         self.config=config;self.address=address;self.gpu=gpu;self.logs:deque[tuple[str,str]]=deque(maxlen=6);self.live:Live|None=None
-        self.data={"phase":"STARTING","supply":0,"difficulty":0,"price":0,"challenge":"—","gate":"—","rate":0.,"job_hashes":0,"session_hashes":0,"best":0,"besthash":"—","batch_ms":0.,"iters":0,"mints":0,"tx":"—"}
+        self.data={"phase":"STARTING","supply":0,"difficulty":0,"price":0,"challenge":"-","rate":0.,"job_hashes":0,"session_hashes":0,"best":0,"besthash":"-","batch_ms":0.,"iters":0,"mints":0,"tx":"-"}
     @staticmethod
-    def short(v: str)->str:return v if len(v)<35 else v[:18]+"…"+v[-12:]
+    def short(v: str)->str:return v if len(v)<35 else v[:18]+"..."+v[-12:]
     @staticmethod
     def rate(v: float)->str:
         if v>=1e9:return f"{v/1e9:.2f} GH/s"
@@ -273,8 +301,8 @@ class UI:
     def render(self)->Group:
         d=self.data;top=Table.grid(expand=True);top.add_column(style="bold cyan",width=13);top.add_column();top.add_column(style="bold cyan",width=12);top.add_column()
         top.add_row("NETWORK",f"{self.config.chain_name} ({self.config.chain_id})","PHASE",str(d["phase"]));top.add_row("WALLET",self.short(self.address),"GPU",self.gpu);top.add_row("CONTRACT",self.short(self.config.contract),"PRICE","FREE" if d["price"]==0 else f"{d['price']/1e18:.8f} ETH");top.add_row("SUPPLY",f"{d['supply']:,} / 10,000","TARGET",f"{d['difficulty']} bits")
-        mining=Table.grid(expand=True);mining.add_column(style="bright_green",width=15);mining.add_column();mining.add_row("HASHRATE",self.rate(float(d["rate"])));mining.add_row("BEST",f"{d['best']} / {d['difficulty']} bits");mining.add_row("HASHES",f"job {self.count(d['job_hashes'])} | session {self.count(d['session_hashes'])}");mining.add_row("GPU BATCH",f"{d['batch_ms']:.0f} ms | {d['iters']} iterations/thread");mining.add_row("MINT GATE",str(d["gate"]));mining.add_row("CHALLENGE",self.short(str(d["challenge"])));mining.add_row("BEST HASH",self.short(str(d["besthash"])));mining.add_row("MINTED",str(d["mints"]));mining.add_row("LAST TX",self.short(str(d["tx"])))
-        lines=[Text(x,style=c) for x,c in self.logs] or [Text("Starting…",style="dim")]
+        mining=Table.grid(expand=True);mining.add_column(style="bright_green",width=15);mining.add_column();mining.add_row("HASHRATE",self.rate(float(d["rate"])));mining.add_row("BEST",f"{d['best']} / {d['difficulty']} bits");mining.add_row("HASHES",f"job {self.count(d['job_hashes'])} | session {self.count(d['session_hashes'])}");mining.add_row("GPU BATCH",f"{d['batch_ms']:.0f} ms | {d['iters']} iterations/thread");mining.add_row("DIFFICULTY",f"live target {d['difficulty']} bits");mining.add_row("CHALLENGE",self.short(str(d["challenge"])));mining.add_row("BEST HASH",self.short(str(d["besthash"])));mining.add_row("MINTED",str(d["mints"]));mining.add_row("LAST TX",self.short(str(d["tx"])))
+        lines=[Text(x,style=c) for x,c in self.logs] or [Text("Starting...",style="dim")]
         return Group(Panel(top,title="HASHGOAT GPU AUTO-MINER",border_style="bright_cyan"),Panel(mining,title="LIVE MINING",border_style="bright_green"),Panel(Group(*lines),title="ACTIVITY",border_style="blue"),Text(" Ctrl+C: stop safely | private key is memory-only ",style="bold black on bright_cyan"))
     def refresh(self)->None:
         if self.live:self.live.update(self.render(),refresh=True)
@@ -283,45 +311,16 @@ class UI:
 def calldata(nonce: int,challenge: str)->str:return MINE+nonce.to_bytes(32,"big").hex()+challenge[2:]
 
 
-def submit(rpc: RpcPool,config: Config,account: Any,nonce: int,challenge: str,price: int)->str:
-    data=calldata(nonce,challenge);request={"from":account.address,"to":config.contract,"value":hex(price),"data":data}
-    try:
-        current,estimate_hex,txnonce_hex,gasprice_hex,block,balance_hex=rpc.batch([
-            call(config.contract,CHALLENGE),
-            ("eth_estimateGas",[request]),
-            ("eth_getTransactionCount",[account.address,"pending"]),
-            ("eth_gasPrice",[]),
-            ("eth_getBlockByNumber",["latest",False]),
-            ("eth_getBalance",[account.address,"latest"]),
-        ])
-    except RpcRejected as exc:
-        latest,_=fresh(rpc,config.contract)
-        if latest!=challenge:raise RpcError("STALE: another miner won before preflight") from exc
-        raise GateClosed(str(exc)) from exc
-    if current.lower()!=challenge:raise RpcError("STALE: challenge changed before submission")
-    estimate=int(estimate_hex,16);limit=max(estimate+5000,int(estimate*1.15));txnonce=int(txnonce_hex,16);gasprice=int(gasprice_hex,16);balance=int(balance_hex,16)
-    rawbase=block.get("baseFeePerGas")
-    if rawbase is None:fee,unit={"gasPrice":gasprice},gasprice
+def submit(rpc: RpcPool,config: Config,account: Any,nonce: int,job: Job)->str:
+    gasprice=job.gas_price
+    if job.base_fee is None:fee,unit={"gasPrice":gasprice},gasprice
     else:
-        base=int(rawbase,16);tip=max(0,gasprice-base);unit=max(gasprice,base*2+tip);fee={"type":2,"maxFeePerGas":unit,"maxPriorityFeePerGas":tip}
-    if balance<price+limit*unit:raise RuntimeError(f"insufficient ETH; need up to {(price+limit*unit)/1e18:.9f} ETH")
-    tx={"chainId":config.chain_id,"nonce":txnonce,"to":config.contract,"value":price,"data":data,"gas":limit,**fee};signed=account.sign_transaction(tx);raw=getattr(signed,"raw_transaction",None) or signed.rawTransaction
-    return rpc.call("eth_sendRawTransaction",["0x"+bytes(raw).hex()])
-
-
-def submit_at_gate(rpc: RpcPool,config: Config,account: Any,nonce: int,job: Job,ui: "UI")->str:
-    opens_at=job.last_mint_at+MINT_INTERVAL_SECONDS
-    announced=False
-    while True:
-        chain_now=time.time()+job.chain_offset;remaining=opens_at-chain_now
-        if remaining>.20:
-            ui.data.update(phase="PROOF READY",gate=f"opens in {remaining:.1f}s");ui.refresh()
-            if not announced:ui.log(f"Proof cached; waiting for gate at {opens_at} (chain time)","cyan");announced=True
-            time.sleep(min(.10,max(.01,remaining-.20)));continue
-        ui.data.update(phase="GATE PREFLIGHT",gate="OPEN / probing");ui.refresh()
-        try:return submit(rpc,config,account,nonce,job.challenge,job.price)
-        except GateClosed:
-            ui.data["gate"]="not open yet";ui.refresh();time.sleep(.10)
+        tip=max(0,gasprice-job.base_fee);unit=max(gasprice,job.base_fee*2+tip);fee={"type":2,"maxFeePerGas":unit,"maxPriorityFeePerGas":tip}
+    required=job.price+MINE_GAS_LIMIT*unit
+    if job.balance<required:raise RuntimeError(f"insufficient ETH; need up to {required/1e18:.9f} ETH")
+    tx={"chainId":config.chain_id,"nonce":job.tx_nonce,"to":config.contract,"value":job.price,"data":calldata(nonce,job.challenge),"gas":MINE_GAS_LIMIT,**fee}
+    signed=account.sign_transaction(tx);raw=getattr(signed,"raw_transaction",None) or signed.rawTransaction;raw_hex="0x"+bytes(raw).hex();tx_hash="0x"+bytes(signed.hash).hex()
+    return rpc.broadcast(raw_hex,tx_hash)
 
 
 def receipt(rpc: RpcPool,txhash: str)->dict[str,Any]:
@@ -357,13 +356,13 @@ def run()->int:
         ui.live=live;ui.log("GPU SHA-256 self-test passed","green");ui.log(f"{config.source}; continuous FREE-only mode")
         try:
             while True:
-                job=state(rpc,config.contract);ui.data.update(phase="READY",supply=job.supply,difficulty=job.difficulty,price=job.price,challenge=job.challenge,job_hashes=0,best=0,besthash="—");ui.refresh()
+                job=state(rpc,config.contract,account.address);ui.data.update(phase="READY",supply=job.supply,difficulty=job.difficulty,price=job.price,challenge=job.challenge,job_hashes=0,best=0,besthash="-");ui.refresh()
                 if job.price!=0:raise RuntimeError(f"FREE-only protection: mintPrice is {job.price} wei")
                 if job.supply>=10000:ui.data["phase"]="SOLD OUT";ui.log("Collection sold out","yellow");break
                 ui.log(f"Mining fresh challenge at {job.difficulty} bits","bright_green");status,nonce,used=gpu.mine(account.address,job,rpc,config.contract,ui,session);session+=used;ui.data["session_hashes"]=session
                 if status=="stale":ui.log("Challenge changed; switched jobs with 0 gas","yellow");continue
-                ui.data["phase"]="SUBMITTING";ui.log(f"Valid nonce {nonce}; contract preflight","green");ui.refresh()
-                try:txhash=submit_at_gate(rpc,config,account,int(nonce),job,ui)
+                ui.data["phase"]="SUBMITTING";ui.log(f"Valid {job.difficulty}-bit proof; immediate {len(rpc.urls)}-route broadcast","green");ui.refresh()
+                try:txhash=submit(rpc,config,account,int(nonce),job)
                 except RpcError as exc:ui.log(str(exc),"yellow");continue
                 ui.data.update(phase="CONFIRMING",tx=txhash);ui.log(f"Submitted {ui.short(txhash)}");result=receipt(rpc,txhash);usedgas=int(result.get("gasUsed","0x0"),16)
                 if int(result.get("status","0x0"),16)==1:ui.data["mints"]+=1;ui.data["phase"]="MINTED";ui.log(f"MINT SUCCESS #{ui.data['mints']} | gas {usedgas:,}","bold green")

@@ -19,7 +19,7 @@ contract:   0x92102325e0B5Ef57709b783b8FF0C55e8f715736
 hash:       SHA256(address(20) || uint256 nonce(32) || challenge(32))
 valid:      leadingZeroBits(hash) >= currentDifficulty()
 submission: mine(uint256 nonce, bytes32 challenge), selector 0xe43e322c
-gate:       lastMintAt() + 15 seconds, selector 0xda444f0b
+difficulty: refreshed automatically for every new challenge
 ```
 
 The bot has FREE-only protection: it stops instead of submitting if `mintPrice()` becomes nonzero. Mining itself is probabilistic, so valid code cannot guarantee beating every competing miner.
