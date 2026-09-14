@@ -209,7 +209,7 @@ class GPU:
     def test(self) -> None:
         address="0x"+"11"*20;challenge="0x"+"42"*32;base=cp.asarray(words(address,challenge));out=cp.zeros(8,cp.uint32)
         for nonce in (0,1,0x1122334455667788):
-            self.one((1,),(1,),(base,np.uint32(nonce),np.uint32(nonce>>32),out));got=b"".join(int(x).to_bytes(4,"big") for x in cp.asnumpy(out))
+            self.one((1,),(1,),(base,np.uint32(nonce & 0xFFFFFFFF),np.uint32((nonce >> 32) & 0xFFFFFFFF),out));got=b"".join(int(x).to_bytes(4,"big") for x in cp.asnumpy(out))
             if got!=digest(address,nonce,challenge):raise RuntimeError("GPU SHA-256 self-test failed")
 
     def mine(self,address: str,job: Job,rpc: RpcPool,contract: str,ui: "UI",session: int) -> tuple[str,int|None,int]:
@@ -217,7 +217,7 @@ class GPU:
         while True:
             self.found.fill(0);self.answer.fill(0);self.best.fill(0);self.bestnonce.fill(0)
             first=(start+offset)&((1<<64)-1);hashes=self.blocks*THREADS*self.iters;began=time.perf_counter()
-            self.kernel((self.blocks,),(THREADS,),(base,np.uint32(first),np.uint32(first>>32),np.uint32(self.iters),np.uint32(job.difficulty),self.found,self.answer,self.best,self.bestnonce));cp.cuda.Stream.null.synchronize();elapsed=max(time.perf_counter()-began,.001)
+            self.kernel((self.blocks,),(THREADS,),(base,np.uint32(first & 0xFFFFFFFF),np.uint32((first >> 32) & 0xFFFFFFFF),np.uint32(self.iters),np.uint32(job.difficulty),self.found,self.answer,self.best,self.bestnonce));cp.cuda.Stream.null.synchronize();elapsed=max(time.perf_counter()-began,.001)
             hit=int(cp.asnumpy(self.found)[0]);nonce=int(cp.asnumpy(self.answer)[0]);batchbest=int(cp.asnumpy(self.best)[0]);bn=int(cp.asnumpy(self.bestnonce)[0]);instant=hashes/elapsed;rate=instant if not rate else rate*.72+instant*.28;count+=hashes;offset=(offset+hashes)&((1<<64)-1)
             if batchbest>best:
                 value=digest(address,bn,job.challenge);bits=zero_bits(value)
