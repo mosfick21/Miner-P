@@ -9,7 +9,11 @@ python -m pip install -r requirements.txt
 python gpu_miner.py
 ```
 
-The script asks only for `PRIVATE_KEY` using hidden terminal input. It never saves the key to a file, config, environment variable, or log. It discovers the public site configuration, verifies the chain and contract, uses the full NVIDIA GPU, CPU-verifies every winning nonce, rejects stale challenges, submits the free mint, and continues until `Ctrl+C`.
+The script asks for `PRIVATE_KEY` and an optional premium HTTP RPC URL using hidden terminal input. Neither is saved to a file, environment variable, or log. It discovers the public site configuration, verifies the chain and contract, uses the NVIDIA GPU, CPU-verifies every winning nonce, rejects stale challenges, and continues until `Ctrl+C` or the paid-mint limit is reached.
+
+At startup, set `MAX MINT PRICE ETH` to `0` for free-only mode or enter the most you authorize per mint. Paid mode defaults to one successful mint; enter `0` for unlimited only if that is intentional. The price guard is checked again before every job.
+
+Premium RPC routes are placed first, health-checked, and connection-warmed. Give the full provider HTTPS endpoint (including its API key if the provider embeds it in the URL). Public fallback routes remain enabled for parallel raw-transaction broadcast.
 
 Verified protocol:
 
