@@ -45,6 +45,7 @@ MINE_GAS_LIMIT = 160_000
 GAS_BUMP_NUM = 125
 GAS_BUMP_DEN = 100
 MIN_PRIORITY_FEE = 1_000_000
+LAST_MINE_BLOCK_SLOT = "0x" + "0" * 62 + "14"
 
 CUDA_SOURCE = r"""
 // NVRTC environments such as Kaggle may not expose host C headers.
@@ -318,7 +319,21 @@ def gas_bump(value: int) -> int:
     return max(value + 1, value * GAS_BUMP_NUM // GAS_BUMP_DEN)
 
 
-def submit(rpc: RpcPool,config: Config,account: Any,nonce: int,job: Job)->str:
+def wait_open_block(rpc: RpcPool, config: Config, job: Job, ui: "UI") -> None:
+    while True:
+        block_hex,last_block_hex,challenge=rpc.batch([
+            ("eth_blockNumber",[]),
+            ("eth_getStorageAt",[config.contract,LAST_MINE_BLOCK_SLOT,"latest"]),
+            call(config.contract,CHALLENGE),
+        ])
+        if challenge.lower()!=job.challenge:raise RpcError("STALE: challenge changed before submission")
+        if as_int(last_block_hex)!=as_int(block_hex):return
+        ui.data["phase"]="WAIT BLOCK";ui.log("Same-block guard active; waiting next block with 0 gas","yellow");ui.refresh()
+        time.sleep(.15)
+
+
+def submit(rpc: RpcPool,config: Config,account: Any,nonce: int,job: Job,ui: "UI")->str:
+    wait_open_block(rpc,config,job,ui)
     gasprice=job.gas_price
     if job.base_fee is None:
         unit=gas_bump(gasprice);fee={"gasPrice":unit}
@@ -381,7 +396,7 @@ def run()->int:
                 ui.log(f"Mining fresh challenge at {job.difficulty} bits","bright_green");status,nonce,used=gpu.mine(account.address,job,rpc,config.contract,ui,session);session+=used;ui.data["session_hashes"]=session
                 if status=="stale":ui.log("Challenge changed; switched jobs with 0 gas","yellow");continue
                 ui.data["phase"]="SUBMITTING";ui.log(f"Valid {job.difficulty}-bit proof; immediate {len(rpc.urls)}-route broadcast","green");ui.refresh()
-                try:txhash=submit(rpc,config,account,int(nonce),job)
+                try:txhash=submit(rpc,config,account,int(nonce),job,ui)
                 except RpcError as exc:ui.log(str(exc),"yellow");continue
                 ui.data.update(phase="CONFIRMING",tx=txhash);ui.log(f"Submitted {ui.short(txhash)}");result=receipt(rpc,txhash);usedgas=int(result.get("gasUsed","0x0"),16)
                 if int(result.get("status","0x0"),16)==1:ui.data["mints"]+=1;ui.data["phase"]="MINTED";ui.log(f"MINT SUCCESS #{ui.data['mints']} | gas {usedgas:,}","bold green")
