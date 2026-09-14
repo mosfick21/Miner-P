@@ -15,6 +15,16 @@ At startup, set `MAX MINT PRICE ETH` to `0` for free-only mode or enter the most
 
 Premium RPC routes are placed first, health-checked, and connection-warmed. Give the full provider HTTPS endpoint (including its API key if the provider embeds it in the URL). Public fallback routes remain enabled for parallel raw-transaction broadcast.
 
+## Hash Rangers
+
+Run the Hash Rangers miner with:
+
+```bash
+python3 ranger_miner.py
+```
+
+It uses the live on-chain price/target/work hash, mines the verified packed Keccak proof on CUDA, refreshes stale work automatically, and calls `mine(uint256,uint256)`.
+
 Verified protocol:
 
 ```text
