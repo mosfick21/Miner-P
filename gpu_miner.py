@@ -42,6 +42,9 @@ POLL_SECONDS = 0.20
 TARGET_BATCH_SECONDS = 0.18
 THREADS = 256
 MINE_GAS_LIMIT = 160_000
+GAS_BUMP_NUM = 125
+GAS_BUMP_DEN = 100
+MIN_PRIORITY_FEE = 1_000_000
 
 CUDA_SOURCE = r"""
 // NVRTC environments such as Kaggle may not expose host C headers.
@@ -311,11 +314,17 @@ class UI:
 def calldata(nonce: int,challenge: str)->str:return MINE+nonce.to_bytes(32,"big").hex()+challenge[2:]
 
 
+def gas_bump(value: int) -> int:
+    return max(value + 1, value * GAS_BUMP_NUM // GAS_BUMP_DEN)
+
+
 def submit(rpc: RpcPool,config: Config,account: Any,nonce: int,job: Job)->str:
     gasprice=job.gas_price
-    if job.base_fee is None:fee,unit={"gasPrice":gasprice},gasprice
+    if job.base_fee is None:
+        unit=gas_bump(gasprice);fee={"gasPrice":unit}
     else:
-        tip=max(0,gasprice-job.base_fee);unit=max(gasprice,job.base_fee*2+tip);fee={"type":2,"maxFeePerGas":unit,"maxPriorityFeePerGas":tip}
+        tip=max(gasprice-job.base_fee,gasprice//10,MIN_PRIORITY_FEE)
+        unit=max(gas_bump(gasprice),job.base_fee*2+tip);fee={"type":2,"maxFeePerGas":unit,"maxPriorityFeePerGas":tip}
     required=job.price+MINE_GAS_LIMIT*unit
     if job.balance<required:raise RuntimeError(f"insufficient ETH; need up to {required/1e18:.9f} ETH")
     tx={"chainId":config.chain_id,"nonce":job.tx_nonce,"to":config.contract,"value":job.price,"data":calldata(nonce,job.challenge),"gas":MINE_GAS_LIMIT,**fee}
@@ -330,6 +339,16 @@ def receipt(rpc: RpcPool,txhash: str)->dict[str,Any]:
         if value:return value
         time.sleep(.4)
     raise TimeoutError("receipt timeout")
+
+
+def revert_reason(rpc: RpcPool, contract: str, job: Job) -> str:
+    try:
+        challenge,difficulty=fresh(rpc,contract)
+        if challenge!=job.challenge:return "Race lost: another miner changed the challenge first"
+        if difficulty!=job.difficulty:return "Stale: difficulty changed before inclusion"
+        return "Reverted with same challenge; refreshing job"
+    except Exception:
+        return "Transaction reverted; refreshing"
 
 
 def private_account()->Any:
@@ -366,7 +385,7 @@ def run()->int:
                 except RpcError as exc:ui.log(str(exc),"yellow");continue
                 ui.data.update(phase="CONFIRMING",tx=txhash);ui.log(f"Submitted {ui.short(txhash)}");result=receipt(rpc,txhash);usedgas=int(result.get("gasUsed","0x0"),16)
                 if int(result.get("status","0x0"),16)==1:ui.data["mints"]+=1;ui.data["phase"]="MINTED";ui.log(f"MINT SUCCESS #{ui.data['mints']} | gas {usedgas:,}","bold green")
-                else:ui.data["phase"]="REVERTED";ui.log("Transaction reverted; refreshing","red")
+                else:ui.data["phase"]="REVERTED";ui.log(revert_reason(rpc,config.contract,job),"red")
                 ui.refresh();time.sleep(.25)
         except KeyboardInterrupt:ui.data["phase"]="STOPPED";ui.log("Stopped safely by user","yellow");ui.refresh()
         except Exception as exc:ui.data["phase"]="ERROR";ui.log(str(exc),"red");ui.refresh();return 1
