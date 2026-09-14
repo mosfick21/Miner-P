@@ -11,7 +11,6 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import cupy as cp
@@ -44,7 +43,6 @@ MINE = "0x071e9503"  # mine(uint256,uint256)
 
 POLL_SECONDS = 0.18
 TARGET_BATCH_SECONDS = 0.18
-THREADS = 256
 MINE_GAS_LIMIT = 300_000
 MIN_PRIORITY_FEE = 20_000_000
 
@@ -62,52 +60,44 @@ __device__ __constant__ uint64_t RC[24]={
 __device__ __constant__ int ROT[24]={1,3,6,10,15,21,28,36,45,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44};
 __device__ __constant__ int PIL[24]={10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1};
 
+__device__ __forceinline__ uint64_t rol(uint64_t x,int n){return (x<<n)|(x>>(64-n));}
 __device__ __forceinline__ uint32_t sw32(uint32_t x){return __byte_perm(x,0,0x0123);}
-__device__ __forceinline__ uint2 xo(uint2 a,uint2 b){return make_uint2(a.x^b.x,a.y^b.y);}
-__device__ __forceinline__ uint2 an(uint2 a,uint2 b){return make_uint2(a.x&b.x,a.y&b.y);}
-__device__ __forceinline__ uint2 nt(uint2 a){return make_uint2(~a.x,~a.y);}
-__device__ __forceinline__ uint2 rol(uint2 v,int n){
- if(n==0)return v;
- if(n<32)return make_uint2((v.x<<n)|(v.y>>(32-n)),(v.y<<n)|(v.x>>(32-n)));
- if(n==32)return make_uint2(v.y,v.x);
- n-=32;return make_uint2((v.y<<n)|(v.x>>(32-n)),(v.x<<n)|(v.y>>(32-n)));
-}
-__device__ __forceinline__ void keccakf(uint2 s[25]){
- uint2 bc[5],t;
+__device__ __forceinline__ void keccakf(uint64_t s[25]){
+ uint64_t bc[5],t;
  #pragma unroll
  for(int r=0;r<24;r++){
   #pragma unroll
-  for(int i=0;i<5;i++)bc[i]=xo(xo(xo(xo(s[i],s[i+5]),s[i+10]),s[i+15]),s[i+20]);
+  for(int i=0;i<5;i++)bc[i]=s[i]^s[i+5]^s[i+10]^s[i+15]^s[i+20];
   #pragma unroll
-  for(int i=0;i<5;i++){t=xo(bc[(i+4)%5],rol(bc[(i+1)%5],1));for(int j=0;j<25;j+=5)s[j+i]=xo(s[j+i],t);}
+  for(int i=0;i<5;i++){t=bc[(i+4)%5]^rol(bc[(i+1)%5],1);for(int j=0;j<25;j+=5)s[j+i]^=t;}
   t=s[1];
   #pragma unroll
   for(int i=0;i<24;i++){int j=PIL[i];bc[0]=s[j];s[j]=rol(t,ROT[i]);t=bc[0];}
   #pragma unroll
-  for(int j=0;j<25;j+=5){for(int i=0;i<5;i++)bc[i]=s[j+i];for(int i=0;i<5;i++)s[j+i]=xo(bc[i],an(nt(bc[(i+1)%5]),bc[(i+2)%5]));}
-  uint64_t rc=RC[r];s[0].x^=(uint32_t)rc;s[0].y^=(uint32_t)(rc>>32);
+  for(int j=0;j<25;j+=5){for(int i=0;i<5;i++)bc[i]=s[j+i];for(int i=0;i<5;i++)s[j+i]=bc[i]^((~bc[(i+1)%5])&bc[(i+2)%5]);}
+  s[0]^=RC[r];
  }
 }
-__device__ __forceinline__ void hash_nonce(const uint32_t*base,uint32_t lo,uint32_t hi,uint32_t out[8]){
- uint2 s[25];
+__device__ __forceinline__ void hash_nonce(const uint64_t*base,uint32_t lo,uint32_t hi,uint32_t out[8]){
+ uint64_t s[25];
  #pragma unroll
- for(int i=0;i<25;i++)s[i]=i<17?make_uint2(base[2*i],base[2*i+1]):make_uint2(0u,0u);
- s[5]=make_uint2(0u,sw32(hi));
- s[6].x=sw32(lo);
+ for(int i=0;i<25;i++)s[i]=i<17?base[i]:0ULL;
+ s[5]=((uint64_t)sw32(hi))<<32;
+ s[6]=(s[6]&0xffffffff00000000ULL)|(uint64_t)sw32(lo);
  keccakf(s);
  #pragma unroll
- for(int i=0;i<4;i++){out[2*i]=sw32(s[i].x);out[2*i+1]=sw32(s[i].y);}
+ for(int i=0;i<4;i++){out[2*i]=sw32((uint32_t)s[i]);out[2*i+1]=sw32((uint32_t)(s[i]>>32));}
 }
 __device__ __forceinline__ uint32_t zero_bits(const uint32_t h[8]){uint32_t n=0;for(int i=0;i<8;i++){if(h[i]==0)n+=32;else{n+=__clz(h[i]);break;}}return n;}
 __device__ __forceinline__ bool below(const uint32_t h[8],const uint32_t*t){for(int i=0;i<8;i++){if(h[i]<t[i])return true;if(h[i]>t[i])return false;}return false;}
 
-extern "C" __global__ void ranger_mine(const uint32_t*base,const uint32_t*target,uint32_t slo,uint32_t shi,uint32_t iters,uint32_t*found,uint64_t*answer,uint32_t*best,uint64_t*bestnonce){
+extern "C" __global__ void ranger_mine(const uint64_t*base,const uint32_t*target,uint32_t slo,uint32_t shi,uint32_t iters,uint32_t*found,uint64_t*answer,uint32_t*best,uint64_t*bestnonce){
  uint64_t tid=(uint64_t)blockIdx.x*blockDim.x+threadIdx.x,stride=(uint64_t)gridDim.x*blockDim.x,start=((uint64_t)shi<<32)|slo;
  uint32_t local=0;uint64_t localnonce=start+tid;
  for(uint32_t i=0;i<iters;i++){if(__ldg(found))break;uint64_t nonce=start+tid+(uint64_t)i*stride;uint32_t h[8];hash_nonce(base,(uint32_t)nonce,(uint32_t)(nonce>>32),h);uint32_t z=zero_bits(h);if(z>local){local=z;localnonce=nonce;}if(below(h,target)){if(atomicCAS(found,0u,1u)==0u)*answer=nonce;break;}}
  uint32_t old=atomicMax(best,local);if(local>old)*bestnonce=localnonce;
 }
-extern "C" __global__ void ranger_hash_one(const uint32_t*base,uint32_t lo,uint32_t hi,uint32_t*out){if(blockIdx.x||threadIdx.x)return;uint32_t h[8];hash_nonce(base,lo,hi,h);for(int i=0;i<8;i++)out[i]=h[i];}
+extern "C" __global__ void ranger_hash_one(const uint64_t*base,uint32_t lo,uint32_t hi,uint32_t*out){if(blockIdx.x||threadIdx.x)return;uint32_t h[8];hash_nonce(base,lo,hi,h);for(int i=0;i<8;i++)out[i]=h[i];}
 """
 
 
@@ -240,7 +230,7 @@ def bits(value: bytes)->int:
 
 def base_lanes(address: str,job: Job)->np.ndarray:
     raw=bytearray(136);raw[:20]=bytes.fromhex(address[2:]);raw[52:84]=bytes.fromhex(job.work[2:]);raw[84:116]=bytes.fromhex(job.block_hash[2:]);raw[116]^=1;raw[135]^=128
-    return np.asarray([int.from_bytes(raw[i:i+4],"little") for i in range(0,136,4)],dtype=np.uint32)
+    return np.asarray([int.from_bytes(raw[i:i+8],"little") for i in range(0,136,8)],dtype=np.uint64)
 
 
 def target_words(target: int)->np.ndarray:
@@ -250,7 +240,7 @@ def target_words(target: int)->np.ndarray:
 class GPU:
     def __init__(self):
         props=cp.cuda.runtime.getDeviceProperties(0);raw=props.get("name",b"NVIDIA GPU");self.name=raw.decode(errors="replace") if isinstance(raw,bytes) else str(raw)
-        self.blocks=max(64,int(props.get("multiProcessorCount",1))*8);self.iters=128
+        self.sms=max(1,int(props.get("multiProcessorCount",1)));self.blocks=max(64,self.sms*8);self.threads=256;self.iters=128;self.tuned_rate=0.
         module=cp.RawModule(code=CUDA_SOURCE,options=("--std=c++14","--use_fast_math"),name_expressions=("ranger_mine","ranger_hash_one"))
         self.kernel=module.get_function("ranger_mine");self.one=module.get_function("ranger_hash_one")
         self.found=cp.zeros(1,cp.uint32);self.answer=cp.zeros(1,cp.uint64);self.best=cp.zeros(1,cp.uint32);self.bestnonce=cp.zeros(1,cp.uint64)
@@ -260,6 +250,24 @@ class GPU:
         for nonce in (0,1,0x1122334455667788):
             self.one((1,),(1,),(base,np.uint32(nonce&0xffffffff),np.uint32(nonce>>32),out));got=b"".join(int(x).to_bytes(4,"big") for x in cp.asnumpy(out))
             if got!=digest(address,nonce,job):raise RuntimeError("GPU Keccak self-test failed")
+        self.tune(base)
+
+    def tune(self,base: Any)->None:
+        never=cp.zeros(8,cp.uint32);best_rate=0.;best=(self.blocks,self.threads)
+        # Warm clocks/JIT before measuring launch shapes.
+        self.found.fill(0);self.best.fill(0)
+        self.kernel((self.sms*8,),(128,),(base,never,np.uint32(0),np.uint32(0),np.uint32(32),self.found,self.answer,self.best,self.bestnonce));cp.cuda.Stream.null.synchronize()
+        for threads in (64,128,256,512):
+            for waves in (2,4,8,16):
+                blocks=max(1,self.sms*waves);lanes=blocks*threads;iters=max(4,16_000_000//lanes)
+                try:
+                    self.found.fill(0);self.best.fill(0);began=time.perf_counter()
+                    self.kernel((blocks,),(threads,),(base,never,np.uint32(12345),np.uint32(0),np.uint32(iters),self.found,self.answer,self.best,self.bestnonce));cp.cuda.Stream.null.synchronize()
+                    rate=(lanes*iters)/max(time.perf_counter()-began,.001)
+                    if rate>best_rate:best_rate=rate;best=(blocks,threads)
+                except Exception:cp.cuda.runtime.getLastError()
+        self.blocks,self.threads=best;self.tuned_rate=best_rate
+        self.iters=max(4,min(65535,int(TARGET_BATCH_SECONDS*best_rate/(self.blocks*self.threads))))
 
     def mine(self,address: str,job: Job,rpc: RpcPool,ui: "UI",session: int)->tuple[str,int|None,int]:
         base=cp.asarray(base_lanes(address,job));target=cp.asarray(target_words(job.target));start=secrets.randbits(64);offset=0;count=0;rate=0.;best=0;besthash="-";probe=None;next_poll=0.
@@ -269,11 +277,11 @@ class GPU:
                 now=time.monotonic()
                 if probe is None and now>=next_poll:probe=watcher.submit(monitor,watch_rpc,address);next_poll=now+POLL_SECONDS
                 self.found.fill(0);self.answer.fill(0);self.best.fill(0);self.bestnonce.fill(0)
-                first=(start+offset)&((1<<64)-1);hashes=self.blocks*THREADS*self.iters;began=time.perf_counter()
-                self.kernel((self.blocks,),(THREADS,),(base,target,np.uint32(first&0xffffffff),np.uint32(first>>32),np.uint32(self.iters),self.found,self.answer,self.best,self.bestnonce));cp.cuda.Stream.null.synchronize();elapsed=max(time.perf_counter()-began,.001)
+                first=(start+offset)&((1<<64)-1);hashes=self.blocks*self.threads*self.iters;began=time.perf_counter()
+                self.kernel((self.blocks,),(self.threads,),(base,target,np.uint32(first&0xffffffff),np.uint32(first>>32),np.uint32(self.iters),self.found,self.answer,self.best,self.bestnonce));cp.cuda.Stream.null.synchronize();elapsed=max(time.perf_counter()-began,.001)
                 hit=int(cp.asnumpy(self.found)[0]);nonce=int(cp.asnumpy(self.answer)[0]);batchbest=int(cp.asnumpy(self.best)[0]);bestnonce=int(cp.asnumpy(self.bestnonce)[0]);instant=hashes/elapsed;rate=instant if not rate else rate*.72+instant*.28;count+=hashes;offset=(offset+hashes)&((1<<64)-1)
                 if batchbest>best:best=batchbest;besthash="0x"+digest(address,bestnonce,job).hex()
-                ui.data.update(phase="MINING",rate=rate,job_hashes=count,session_hashes=session+count,best=best,besthash=besthash,batch_ms=elapsed*1000,iters=self.iters);ui.refresh()
+                ui.data.update(phase="MINING",rate=rate,job_hashes=count,session_hashes=session+count,best=best,besthash=besthash,batch_ms=elapsed*1000,iters=self.iters,threads=self.threads);ui.refresh()
                 self.iters=max(16,min(16384,int(self.iters*min(1.45,max(.70,TARGET_BATCH_SECONDS/elapsed)))))
                 if probe is not None and probe.done():
                     try:
@@ -292,7 +300,7 @@ class GPU:
 class UI:
     def __init__(self,address: str,gpu: str,routes: int):
         self.address=address;self.gpu=gpu;self.routes=routes;self.logs:deque[tuple[str,str]]=deque(maxlen=6);self.live:Live|None=None
-        self.data={"phase":"STARTING","total":0,"price":0,"target":0,"rate":0.,"job_hashes":0,"session_hashes":0,"best":0,"besthash":"-","batch_ms":0.,"iters":0,"mints":0,"tx":"-"}
+        self.data={"phase":"STARTING","total":0,"price":0,"target":0,"rate":0.,"job_hashes":0,"session_hashes":0,"best":0,"besthash":"-","batch_ms":0.,"iters":0,"threads":0,"mints":0,"tx":"-"}
     @staticmethod
     def short(v: str)->str:return v if len(v)<35 else v[:18]+"..."+v[-12:]
     @staticmethod
@@ -303,7 +311,7 @@ class UI:
     def render(self)->Group:
         d=self.data;top=Table.grid(expand=True);top.add_column(style="bold cyan",width=12);top.add_column();top.add_column(style="bold cyan",width=12);top.add_column()
         top.add_row("NETWORK",f"{CHAIN_NAME} ({CHAIN_ID})","PHASE",d["phase"]);top.add_row("WALLET",self.short(self.address),"GPU",self.gpu);top.add_row("CONTRACT",self.short(CONTRACT),"PRICE","FREE" if d["price"]==0 else f"{d['price']/1e18:.6f} ETH");top.add_row("SUPPLY",f"{d['total']:,} / {MAX_SUPPLY:,}","RPC ROUTES",str(self.routes))
-        mine=Table.grid(expand=True);mine.add_column(style="bright_green",width=14);mine.add_column();mine.add_row("HASHRATE",self.rate(d["rate"]));mine.add_row("BEST",f"{d['best']} leading-zero bits");mine.add_row("HASHES",f"job {self.count(d['job_hashes'])} | session {self.count(d['session_hashes'])}");mine.add_row("GPU BATCH",f"{d['batch_ms']:.0f} ms | {d['iters']} iterations/thread");mine.add_row("TARGET",f"0x{d['target']:064x}" if d["target"] else "-");mine.add_row("BEST HASH",self.short(d["besthash"]));mine.add_row("MINTED",str(d["mints"]));mine.add_row("LAST TX",self.short(d["tx"]))
+        mine=Table.grid(expand=True);mine.add_column(style="bright_green",width=14);mine.add_column();mine.add_row("HASHRATE",self.rate(d["rate"]));mine.add_row("BEST",f"{d['best']} leading-zero bits");mine.add_row("HASHES",f"job {self.count(d['job_hashes'])} | session {self.count(d['session_hashes'])}");mine.add_row("GPU BATCH",f"{d['batch_ms']:.0f} ms | {d['threads']} threads | {d['iters']} iterations");mine.add_row("TARGET",f"0x{d['target']:064x}" if d["target"] else "-");mine.add_row("BEST HASH",self.short(d["besthash"]));mine.add_row("MINTED",str(d["mints"]));mine.add_row("LAST TX",self.short(d["tx"]))
         lines=[Text(x,style=color) for x,color in self.logs] or [Text("Starting...",style="dim")]
         return Group(Panel(top,title="HASH RANGERS GPU AUTO-MINER",border_style="bright_cyan"),Panel(mine,title="LIVE MINING",border_style="bright_green"),Panel(Group(*lines),title="ACTIVITY",border_style="blue"),Text(" Ctrl+C: stop safely | secrets are memory-only ",style="bold black on bright_cyan"))
     def refresh(self)->None:
@@ -335,7 +343,7 @@ def receipt(rpc: RpcPool,txhash: str)->dict[str,Any]:
     raise TimeoutError("receipt timeout")
 
 
-def options()->tuple[Any,list[str],int,int]:
+def options()->tuple[Any,list[str]]:
     key=getpass.getpass("PRIVATE_KEY (hidden, never saved): ").strip()
     if not key:raise ValueError("empty private key")
     if not key.startswith("0x"):key="0x"+key
@@ -346,35 +354,27 @@ def options()->tuple[Any,list[str],int,int]:
         for url in re.split(r"[,\s]+",premium):
             if not re.match(r"^https?://",url,re.I):raise ValueError("RPC must start with http:// or https://")
             urls.append(url.rstrip("/"))
-    raw=input("MAX MINT PRICE ETH (0 = FREE only): ").strip() or "0"
-    try:max_price=int(Decimal(raw)*Decimal(10**18))
-    except (InvalidOperation,ValueError):raise ValueError("invalid maximum price")
-    raw_count=input("MAX PAID MINTS (Enter = 1, 0 = unlimited): ").strip() or "1"
-    max_paid=int(raw_count)
-    if max_price<0 or max_paid<0:raise ValueError("limits cannot be negative")
-    return account,list(dict.fromkeys(urls+RPC_URLS)),max_price,max_paid
+    return account,list(dict.fromkeys(urls+RPC_URLS))
 
 
 def run()->int:
     console=Console();console.print("[bold cyan]Hash Rangers GPU Auto-Miner[/bold cyan]")
-    try:account,urls,max_price,max_paid=options();rpc=RpcPool(urls);warm=rpc.warmup();job=get_job(rpc,account.address);gpu=GPU();gpu.test(account.address,job)
+    try:account,urls=options();rpc=RpcPool(urls);warm=rpc.warmup();job=get_job(rpc,account.address);gpu=GPU();gpu.test(account.address,job)
     except Exception as exc:console.print(f"[red]Startup failed: {exc}[/red]");return 1
-    ui=UI(account.address,gpu.name,len(rpc.urls));session=0;paid_mints=0
+    ui=UI(account.address,gpu.name,len(rpc.urls));session=0
     with Live(ui.render(),console=console,refresh_per_second=4,screen=False) as live:
-        ui.live=live;ui.log("GPU Keccak self-test passed","green");ui.log("RPC warm: "+" | ".join(f"#{i+1} {ms:.0f}ms" for i,ms in enumerate(warm)),"green")
+        ui.live=live;ui.log("GPU Keccak self-test passed","green");ui.log(f"Auto-tuned {gpu.threads} threads | {gpu.blocks:,} blocks | benchmark {UI.rate(gpu.tuned_rate)}","green");ui.log("RPC warm: "+" | ".join(f"#{i+1} {ms:.0f}ms" for i,ms in enumerate(warm)),"green")
         try:
             while True:
                 job=get_job(rpc,account.address);ui.data.update(phase="READY",total=job.total,price=job.price,target=job.target,job_hashes=0,best=0,besthash="-");ui.refresh()
                 if job.paused:raise RuntimeError("contract is paused")
                 if job.remaining<=0 or job.total>=MAX_SUPPLY:ui.log("Collection sold out","yellow");break
-                if job.price>max_price:raise RuntimeError(f"PRICE GUARD: {job.price/1e18:.6f} ETH exceeds cap {max_price/1e18:.6f} ETH")
-                if job.price and max_paid and paid_mints>=max_paid:ui.log("Paid mint limit reached","yellow");break
                 ui.log("Mining current proof","bright_green");status,nonce,used=gpu.mine(account.address,job,rpc,ui,session);session+=used;ui.data["session_hashes"]=session
                 if status=="stale":ui.log("Mining state changed; switched with 0 gas","yellow");continue
                 ui.data["phase"]="SUBMITTING";ui.log(f"Valid proof; immediate {len(rpc.urls)}-route broadcast","green");ui.refresh()
                 txhash=submit(rpc,account,int(nonce),job);ui.data.update(phase="CONFIRMING",tx=txhash);ui.log(f"Submitted {ui.short(txhash)}")
                 result=receipt(rpc,txhash);gas=n(result.get("gasUsed","0x0"))
-                if n(result.get("status","0x0"))==1:ui.data["mints"]+=1;paid_mints+=int(job.price>0);ui.log(f"MINT SUCCESS #{ui.data['mints']} | gas {gas:,}","bold green")
+                if n(result.get("status","0x0"))==1:ui.data["mints"]+=1;ui.log(f"MINT SUCCESS | gas {gas:,}","bold green");ui.refresh();break
                 else:ui.log("Transaction reverted; proof/state lost the race","red")
                 ui.refresh()
         except KeyboardInterrupt:ui.log("Stopped safely by user","yellow")
