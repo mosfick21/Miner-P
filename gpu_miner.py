@@ -97,6 +97,10 @@ class RpcError(RuntimeError):
     pass
 
 
+class RpcRejected(RpcError):
+    """A valid JSON-RPC response rejected the call; retrying cannot fix it."""
+
+
 class RpcPool:
     def __init__(self, urls: list[str]):
         self.urls = list(dict.fromkeys(urls)); self.index = 0; self.ident = 0
@@ -109,8 +113,10 @@ class RpcPool:
             try:
                 response = self.sessions[url].post(url, json={"jsonrpc":"2.0","id":self.ident,"method":method,"params":params or []}, timeout=12)
                 response.raise_for_status(); body = response.json()
-                if body.get("error"): raise RpcError(body["error"].get("message", str(body["error"])))
+                if body.get("error"): raise RpcRejected(body["error"].get("message", str(body["error"])))
                 self.index = self.urls.index(url); return body["result"]
+            except RpcRejected:
+                raise
             except Exception as exc:
                 error = exc; time.sleep(min(.15 * (attempt + 1), .75))
         raise RpcError(f"RPC failed: {error}")
@@ -126,9 +132,11 @@ class RpcPool:
                 response=self.sessions[url].post(url,json=payload,timeout=12);response.raise_for_status();items=response.json();by_id={x["id"]:x for x in items};out=[]
                 for ident in ids:
                     item=by_id[ident]
-                    if item.get("error"):raise RpcError(item["error"].get("message",str(item["error"])))
+                    if item.get("error"):raise RpcRejected(item["error"].get("message",str(item["error"])))
                     out.append(item["result"])
                 self.index=self.urls.index(url);return out
+            except RpcRejected:
+                raise
             except Exception as exc:
                 error=exc;time.sleep(min(.15*(attempt+1),.75))
         raise RpcError(f"RPC batch failed: {error}")
@@ -265,19 +273,27 @@ class UI:
 def calldata(nonce: int,challenge: str)->str:return MINE+nonce.to_bytes(32,"big").hex()+challenge[2:]
 
 
-def fees(rpc: RpcPool)->tuple[dict[str,int],int]:
-    gasprice=int(rpc.call("eth_gasPrice"),16);block=rpc.call("eth_getBlockByNumber",["latest",False]);raw=block.get("baseFeePerGas")
-    if raw is None:return {"gasPrice":gasprice},gasprice
-    base=int(raw,16)
-    try:tip=int(rpc.call("eth_maxPriorityFeePerGas"),16)
-    except Exception:tip=max(0,gasprice-base)
-    ceiling=max(gasprice,base*2+tip);return {"type":2,"maxFeePerGas":ceiling,"maxPriorityFeePerGas":tip},ceiling
-
-
 def submit(rpc: RpcPool,config: Config,account: Any,nonce: int,challenge: str,price: int)->str:
-    current,_=fresh(rpc,config.contract)
-    if current!=challenge:raise RpcError("STALE: challenge changed before submission")
-    data=calldata(nonce,challenge);request={"from":account.address,"to":config.contract,"value":hex(price),"data":data};estimate=int(rpc.call("eth_estimateGas",[request]),16);limit=max(estimate+5000,int(estimate*1.15));txnonce=int(rpc.call("eth_getTransactionCount",[account.address,"pending"]),16);fee,unit=fees(rpc);balance=int(rpc.call("eth_getBalance",[account.address,"latest"]),16)
+    data=calldata(nonce,challenge);request={"from":account.address,"to":config.contract,"value":hex(price),"data":data}
+    try:
+        current,estimate_hex,txnonce_hex,gasprice_hex,block,balance_hex=rpc.batch([
+            call(config.contract,CHALLENGE),
+            ("eth_estimateGas",[request]),
+            ("eth_getTransactionCount",[account.address,"pending"]),
+            ("eth_gasPrice",[]),
+            ("eth_getBlockByNumber",["latest",False]),
+            ("eth_getBalance",[account.address,"latest"]),
+        ])
+    except RpcRejected as exc:
+        latest,_=fresh(rpc,config.contract)
+        if latest!=challenge:raise RpcError("STALE: another miner won before preflight") from exc
+        raise RpcError(f"Preflight rejected: {exc}") from exc
+    if current.lower()!=challenge:raise RpcError("STALE: challenge changed before submission")
+    estimate=int(estimate_hex,16);limit=max(estimate+5000,int(estimate*1.15));txnonce=int(txnonce_hex,16);gasprice=int(gasprice_hex,16);balance=int(balance_hex,16)
+    rawbase=block.get("baseFeePerGas")
+    if rawbase is None:fee,unit={"gasPrice":gasprice},gasprice
+    else:
+        base=int(rawbase,16);tip=max(0,gasprice-base);unit=max(gasprice,base*2+tip);fee={"type":2,"maxFeePerGas":unit,"maxPriorityFeePerGas":tip}
     if balance<price+limit*unit:raise RuntimeError(f"insufficient ETH; need up to {(price+limit*unit)/1e18:.9f} ETH")
     tx={"chainId":config.chain_id,"nonce":txnonce,"to":config.contract,"value":price,"data":data,"gas":limit,**fee};signed=account.sign_transaction(tx);raw=getattr(signed,"raw_transaction",None) or signed.rawTransaction
     return rpc.call("eth_sendRawTransaction",["0x"+bytes(raw).hex()])
