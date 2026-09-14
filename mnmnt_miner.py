@@ -41,7 +41,10 @@ SUPPLY = 8190
 STATE = "0xc19d93fb"                 # state()
 LAY = "0x517ec447"                   # lay(uint256,uint256)
 POLL_SECONDS = 0.25
-TARGET_BATCH_SECONDS = 0.18
+# Aggressive GPU mode: keep each launch busy long enough to remove notebook /
+# Python launch overhead. There is deliberately no sleep or utilization cap in
+# the mining loop.
+TARGET_BATCH_SECONDS = 0.75
 GAS_LIMIT = 800_000
 MIN_PRIORITY_FEE = 20_000_000
 
@@ -189,6 +192,11 @@ class GPU:
             if got != digest(address, nonce, job.seed):
                 raise RuntimeError("GPU Keccak self-test failed")
         self.tune(base)
+        # KeccakGPU.tune benchmarks launch geometry with a short latency target.
+        # MNMNT uses throughput-first batches, sized immediately from that
+        # measured rate instead of slowly ramping up over several launches.
+        lanes = self.blocks * self.threads
+        self.iters = max(16, min(65535, int(TARGET_BATCH_SECONDS * self.tuned_rate / lanes)))
 
     def mine(self, address: str, job: Job, rpc: RpcPool, ui: "UI", session: int) -> tuple[str, int | None, int]:
         base = cp.asarray(base_lanes(address, job.seed))
@@ -432,7 +440,7 @@ def run() -> int:
     with Live(ui.render(), console=console, refresh_per_second=4, screen=False) as live:
         ui.live = live
         ui.log("GPU Keccak self-test passed", "green")
-        ui.log(f"Auto-tuned benchmark {UI.rate(gpu.tuned_rate)}", "green")
+        ui.log(f"FULL GPU mode | auto-tuned benchmark {UI.rate(gpu.tuned_rate)}", "green")
         ui.log("RPC warm: " + " | ".join(f"#{i + 1} {ms:.0f}ms" for i, ms in enumerate(warm)), "green")
         ui.log("FREE-only lock active: every lay transaction sends 0 ETH", "bright_green")
         try:
