@@ -62,44 +62,52 @@ __device__ __constant__ uint64_t RC[24]={
 __device__ __constant__ int ROT[24]={1,3,6,10,15,21,28,36,45,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44};
 __device__ __constant__ int PIL[24]={10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1};
 
-__device__ __forceinline__ uint64_t rol(uint64_t x,int n){return (x<<n)|(x>>(64-n));}
 __device__ __forceinline__ uint32_t sw32(uint32_t x){return __byte_perm(x,0,0x0123);}
-__device__ __forceinline__ void keccakf(uint64_t s[25]){
- uint64_t bc[5],t;
+__device__ __forceinline__ uint2 xo(uint2 a,uint2 b){return make_uint2(a.x^b.x,a.y^b.y);}
+__device__ __forceinline__ uint2 an(uint2 a,uint2 b){return make_uint2(a.x&b.x,a.y&b.y);}
+__device__ __forceinline__ uint2 nt(uint2 a){return make_uint2(~a.x,~a.y);}
+__device__ __forceinline__ uint2 rol(uint2 v,int n){
+ if(n==0)return v;
+ if(n<32)return make_uint2((v.x<<n)|(v.y>>(32-n)),(v.y<<n)|(v.x>>(32-n)));
+ if(n==32)return make_uint2(v.y,v.x);
+ n-=32;return make_uint2((v.y<<n)|(v.x>>(32-n)),(v.x<<n)|(v.y>>(32-n)));
+}
+__device__ __forceinline__ void keccakf(uint2 s[25]){
+ uint2 bc[5],t;
  #pragma unroll
  for(int r=0;r<24;r++){
   #pragma unroll
-  for(int i=0;i<5;i++)bc[i]=s[i]^s[i+5]^s[i+10]^s[i+15]^s[i+20];
+  for(int i=0;i<5;i++)bc[i]=xo(xo(xo(xo(s[i],s[i+5]),s[i+10]),s[i+15]),s[i+20]);
   #pragma unroll
-  for(int i=0;i<5;i++){t=bc[(i+4)%5]^rol(bc[(i+1)%5],1);for(int j=0;j<25;j+=5)s[j+i]^=t;}
+  for(int i=0;i<5;i++){t=xo(bc[(i+4)%5],rol(bc[(i+1)%5],1));for(int j=0;j<25;j+=5)s[j+i]=xo(s[j+i],t);}
   t=s[1];
   #pragma unroll
   for(int i=0;i<24;i++){int j=PIL[i];bc[0]=s[j];s[j]=rol(t,ROT[i]);t=bc[0];}
   #pragma unroll
-  for(int j=0;j<25;j+=5){for(int i=0;i<5;i++)bc[i]=s[j+i];for(int i=0;i<5;i++)s[j+i]=bc[i]^((~bc[(i+1)%5])&bc[(i+2)%5]);}
-  s[0]^=RC[r];
+  for(int j=0;j<25;j+=5){for(int i=0;i<5;i++)bc[i]=s[j+i];for(int i=0;i<5;i++)s[j+i]=xo(bc[i],an(nt(bc[(i+1)%5]),bc[(i+2)%5]));}
+  uint64_t rc=RC[r];s[0].x^=(uint32_t)rc;s[0].y^=(uint32_t)(rc>>32);
  }
 }
-__device__ __forceinline__ void hash_nonce(const uint64_t*base,uint32_t lo,uint32_t hi,uint32_t out[8]){
- uint64_t s[25];
+__device__ __forceinline__ void hash_nonce(const uint32_t*base,uint32_t lo,uint32_t hi,uint32_t out[8]){
+ uint2 s[25];
  #pragma unroll
- for(int i=0;i<25;i++)s[i]=i<17?base[i]:0ULL;
- s[5]=((uint64_t)sw32(hi))<<32;
- s[6]=(s[6]&0xffffffff00000000ULL)|(uint64_t)sw32(lo);
+ for(int i=0;i<25;i++)s[i]=i<17?make_uint2(base[2*i],base[2*i+1]):make_uint2(0u,0u);
+ s[5]=make_uint2(0u,sw32(hi));
+ s[6].x=sw32(lo);
  keccakf(s);
  #pragma unroll
- for(int i=0;i<4;i++){out[2*i]=sw32((uint32_t)s[i]);out[2*i+1]=sw32((uint32_t)(s[i]>>32));}
+ for(int i=0;i<4;i++){out[2*i]=sw32(s[i].x);out[2*i+1]=sw32(s[i].y);}
 }
 __device__ __forceinline__ uint32_t zero_bits(const uint32_t h[8]){uint32_t n=0;for(int i=0;i<8;i++){if(h[i]==0)n+=32;else{n+=__clz(h[i]);break;}}return n;}
 __device__ __forceinline__ bool below(const uint32_t h[8],const uint32_t*t){for(int i=0;i<8;i++){if(h[i]<t[i])return true;if(h[i]>t[i])return false;}return false;}
 
-extern "C" __global__ void ranger_mine(const uint64_t*base,const uint32_t*target,uint32_t slo,uint32_t shi,uint32_t iters,uint32_t*found,uint64_t*answer,uint32_t*best,uint64_t*bestnonce){
+extern "C" __global__ void ranger_mine(const uint32_t*base,const uint32_t*target,uint32_t slo,uint32_t shi,uint32_t iters,uint32_t*found,uint64_t*answer,uint32_t*best,uint64_t*bestnonce){
  uint64_t tid=(uint64_t)blockIdx.x*blockDim.x+threadIdx.x,stride=(uint64_t)gridDim.x*blockDim.x,start=((uint64_t)shi<<32)|slo;
  uint32_t local=0;uint64_t localnonce=start+tid;
  for(uint32_t i=0;i<iters;i++){if(__ldg(found))break;uint64_t nonce=start+tid+(uint64_t)i*stride;uint32_t h[8];hash_nonce(base,(uint32_t)nonce,(uint32_t)(nonce>>32),h);uint32_t z=zero_bits(h);if(z>local){local=z;localnonce=nonce;}if(below(h,target)){if(atomicCAS(found,0u,1u)==0u)*answer=nonce;break;}}
  uint32_t old=atomicMax(best,local);if(local>old)*bestnonce=localnonce;
 }
-extern "C" __global__ void ranger_hash_one(const uint64_t*base,uint32_t lo,uint32_t hi,uint32_t*out){if(blockIdx.x||threadIdx.x)return;uint32_t h[8];hash_nonce(base,lo,hi,h);for(int i=0;i<8;i++)out[i]=h[i];}
+extern "C" __global__ void ranger_hash_one(const uint32_t*base,uint32_t lo,uint32_t hi,uint32_t*out){if(blockIdx.x||threadIdx.x)return;uint32_t h[8];hash_nonce(base,lo,hi,h);for(int i=0;i<8;i++)out[i]=h[i];}
 """
 
 
@@ -232,7 +240,7 @@ def bits(value: bytes)->int:
 
 def base_lanes(address: str,job: Job)->np.ndarray:
     raw=bytearray(136);raw[:20]=bytes.fromhex(address[2:]);raw[52:84]=bytes.fromhex(job.work[2:]);raw[84:116]=bytes.fromhex(job.block_hash[2:]);raw[116]^=1;raw[135]^=128
-    return np.asarray([int.from_bytes(raw[i:i+8],"little") for i in range(0,136,8)],dtype=np.uint64)
+    return np.asarray([int.from_bytes(raw[i:i+4],"little") for i in range(0,136,4)],dtype=np.uint32)
 
 
 def target_words(target: int)->np.ndarray:
