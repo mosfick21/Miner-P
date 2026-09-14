@@ -158,45 +158,77 @@ def target_words(target: int) -> np.ndarray:
 class GPU:
     tune = KeccakGPU.tune
 
-    def __init__(self) -> None:
-        props = cp.cuda.runtime.getDeviceProperties(0)
-        name = props.get("name", b"NVIDIA GPU")
-        self.name = name.decode(errors="replace") if isinstance(name, bytes) else str(name)
-        self.sms = max(1, int(props.get("multiProcessorCount", 1)))
-        self.blocks = max(64, self.sms * 8)
-        self.threads = 256
-        self.iters = 128
-        self.tuned_rate = 0.0
-        module = cp.RawModule(
-            code=CUDA_SOURCE,
-            options=("--std=c++14", "--use_fast_math"),
-            name_expressions=("ranger_mine", "ranger_hash_one"),
-        )
-        self.kernel = module.get_function("ranger_mine")
-        self.one = module.get_function("ranger_hash_one")
-        self.found = cp.zeros(1, cp.uint32)
-        self.answer = cp.zeros(1, cp.uint64)
-        self.best = cp.zeros(1, cp.uint32)
-        self.bestnonce = cp.zeros(1, cp.uint64)
+    def __init__(self, device_id: int) -> None:
+        self.device_id = device_id
+        with cp.cuda.Device(device_id):
+            props = cp.cuda.runtime.getDeviceProperties(device_id)
+            name = props.get("name", b"NVIDIA GPU")
+            self.name = name.decode(errors="replace") if isinstance(name, bytes) else str(name)
+            self.sms = max(1, int(props.get("multiProcessorCount", 1)))
+            self.blocks = max(64, self.sms * 8)
+            self.threads = 256
+            self.iters = 128
+            self.tuned_rate = 0.0
+            module = cp.RawModule(
+                code=CUDA_SOURCE,
+                options=("--std=c++14", "--use_fast_math"),
+                name_expressions=("ranger_mine", "ranger_hash_one"),
+            )
+            self.kernel = module.get_function("ranger_mine")
+            self.one = module.get_function("ranger_hash_one")
+            self.found = cp.zeros(1, cp.uint32)
+            self.answer = cp.zeros(1, cp.uint64)
+            self.best = cp.zeros(1, cp.uint32)
+            self.bestnonce = cp.zeros(1, cp.uint64)
+            self.base = None
+            self.target = None
 
     def test(self, address: str, job: Job) -> None:
-        base = cp.asarray(base_lanes(address, job.seed))
-        out = cp.zeros(8, cp.uint32)
-        for nonce in (0, 1, 0x1122334455667788):
-            self.one(
-                (1,),
-                (1,),
-                (base, np.uint32(nonce & 0xFFFFFFFF), np.uint32(nonce >> 32), out),
+        with cp.cuda.Device(self.device_id):
+            base = cp.asarray(base_lanes(address, job.seed))
+            out = cp.zeros(8, cp.uint32)
+            for nonce in (0, 1, 0x1122334455667788):
+                self.one(
+                    (1,),
+                    (1,),
+                    (base, np.uint32(nonce & 0xFFFFFFFF), np.uint32(nonce >> 32), out),
+                )
+                got = b"".join(int(x).to_bytes(4, "big") for x in cp.asnumpy(out))
+                if got != digest(address, nonce, job.seed):
+                    raise RuntimeError(f"GPU #{self.device_id + 1} Keccak self-test failed")
+            self.tune(base)
+            lanes = self.blocks * self.threads
+            self.iters = max(16, min(65535, int(TARGET_BATCH_SECONDS * self.tuned_rate / lanes)))
+
+    def prepare(self, address: str, job: Job) -> None:
+        with cp.cuda.Device(self.device_id):
+            self.base = cp.asarray(base_lanes(address, job.seed))
+            self.target = cp.asarray(target_words(job.target))
+
+    def batch(self, first: int) -> dict[str, Any]:
+        with cp.cuda.Device(self.device_id):
+            self.found.fill(0); self.answer.fill(0); self.best.fill(0); self.bestnonce.fill(0)
+            hashes = self.blocks * self.threads * self.iters
+            began = time.perf_counter()
+            self.kernel(
+                (self.blocks,), (self.threads,),
+                (self.base, self.target, np.uint32(first & 0xFFFFFFFF), np.uint32(first >> 32),
+                 np.uint32(self.iters), self.found, self.answer, self.best, self.bestnonce),
             )
-            got = b"".join(int(x).to_bytes(4, "big") for x in cp.asnumpy(out))
-            if got != digest(address, nonce, job.seed):
-                raise RuntimeError("GPU Keccak self-test failed")
-        self.tune(base)
-        # KeccakGPU.tune benchmarks launch geometry with a short latency target.
-        # MNMNT uses throughput-first batches, sized immediately from that
-        # measured rate instead of slowly ramping up over several launches.
-        lanes = self.blocks * self.threads
-        self.iters = max(16, min(65535, int(TARGET_BATCH_SECONDS * self.tuned_rate / lanes)))
+            cp.cuda.Stream.null.synchronize()
+            elapsed = max(time.perf_counter() - began, 0.001)
+            result = {
+                "device": self.device_id,
+                "hit": int(cp.asnumpy(self.found)[0]),
+                "nonce": int(cp.asnumpy(self.answer)[0]),
+                "best": int(cp.asnumpy(self.best)[0]),
+                "bestnonce": int(cp.asnumpy(self.bestnonce)[0]),
+                "hashes": hashes,
+                "elapsed": elapsed,
+                "rate": hashes / elapsed,
+            }
+            self.iters = max(16, min(65535, int(self.iters * min(1.35, max(0.75, TARGET_BATCH_SECONDS / elapsed)))))
+            return result
 
     def mine(self, address: str, job: Job, rpc: RpcPool, ui: "UI", session: int) -> tuple[str, int | None, int]:
         base = cp.asarray(base_lanes(address, job.seed))
@@ -281,6 +313,84 @@ class GPU:
                     return "found", nonce, count
         finally:
             watcher.shutdown(wait=False, cancel_futures=True)
+
+
+class GPUFarm:
+    """Run one independent nonce lane on every visible CUDA GPU."""
+
+    def __init__(self) -> None:
+        count = int(cp.cuda.runtime.getDeviceCount())
+        if count < 1:
+            raise RuntimeError("No CUDA GPU found")
+        self.gpus = [GPU(i) for i in range(count)]
+        self.name = " + ".join(f"#{i + 1} {gpu.name}" for i, gpu in enumerate(self.gpus))
+        self.tuned_rate = 0.0
+
+    def test(self, address: str, job: Job) -> None:
+        for gpu in self.gpus:
+            gpu.test(address, job)
+        self.tuned_rate = sum(gpu.tuned_rate for gpu in self.gpus)
+
+    def mine(self, address: str, job: Job, rpc: RpcPool, ui: "UI", session: int) -> tuple[str, int | None, int]:
+        for gpu in self.gpus:
+            gpu.prepare(address, job)
+        starts = [secrets.randbits(64) for _ in self.gpus]
+        offsets = [0 for _ in self.gpus]
+        count = best = 0
+        best_hash = "-"
+        pool = ThreadPoolExecutor(max_workers=len(self.gpus))
+        monitor_pool = ThreadPoolExecutor(max_workers=1)
+        watch_rpc = RpcPool(rpc.urls)
+        try:
+            while True:
+                state_future = monitor_pool.submit(read_state, watch_rpc)
+                futures = [
+                    pool.submit(gpu.batch, (starts[i] + offsets[i]) & ((1 << 64) - 1))
+                    for i, gpu in enumerate(self.gpus)
+                ]
+                results = [future.result() for future in futures]
+                batch_hashes = sum(result["hashes"] for result in results)
+                count += batch_hashes
+                for i, result in enumerate(results):
+                    offsets[i] = (offsets[i] + result["hashes"]) & ((1 << 64) - 1)
+                    if result["best"] > best:
+                        best = result["best"]
+                        best_hash = "0x" + digest(address, result["bestnonce"], job.seed).hex()
+                total_rate = sum(result["rate"] for result in results)
+                ui.data.update(
+                    phase="MINING", rate=total_rate, job_hashes=count,
+                    session_hashes=session + count, best=best, besthash=best_hash,
+                    batch_ms=max(result["elapsed"] for result in results) * 1000,
+                )
+                ui.refresh()
+
+                current = None
+                try:
+                    current = state_future.result(timeout=2)
+                except TimeoutError:
+                    pass
+                except Exception as exc:
+                    ui.log(f"RPC monitor retry: {exc}", "yellow")
+
+                for result in results:
+                    if result["hit"]:
+                        if current is not None and (current.seed != job.seed or current.laid >= SUPPLY):
+                            continue
+                        nonce = result["nonce"]
+                        proof = digest(address, nonce, job.seed)
+                        live_target = current.target if current is not None and current.seed == job.seed else job.target
+                        if int.from_bytes(proof, "big") >= live_target:
+                            continue
+                        if int.from_bytes(proof, "big") >= job.target:
+                            raise RuntimeError(f"GPU #{result['device'] + 1} nonce failed CPU verification")
+                        return "found", nonce, count
+                if current is not None and (
+                    current.seed != job.seed or current.laid >= SUPPLY or current.target != job.target
+                ):
+                    return "stale", None, count
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            monitor_pool.shutdown(wait=False, cancel_futures=True)
 
 
 class UI:
@@ -429,7 +539,7 @@ def run() -> int:
         job = get_job(rpc, account.address)
         if job.seed == "0x" + "00" * 32:
             raise RuntimeError(f"Contract is not open yet (openAt {job.open_at})")
-        gpu = GPU()
+        gpu = GPUFarm()
         gpu.test(account.address, job)
     except Exception as exc:
         console.print(f"[red]Startup failed: {exc}[/red]")
@@ -439,8 +549,8 @@ def run() -> int:
     session_hashes = 0
     with Live(ui.render(), console=console, refresh_per_second=4, screen=False) as live:
         ui.live = live
-        ui.log("GPU Keccak self-test passed", "green")
-        ui.log(f"FULL GPU mode | auto-tuned benchmark {UI.rate(gpu.tuned_rate)}", "green")
+        ui.log(f"{len(gpu.gpus)} GPU(s) detected; all Keccak self-tests passed", "green")
+        ui.log(f"ALL-GPU mode | combined benchmark {UI.rate(gpu.tuned_rate)}", "green")
         ui.log("RPC warm: " + " | ".join(f"#{i + 1} {ms:.0f}ms" for i, ms in enumerate(warm)), "green")
         ui.log("FREE-only lock active: every lay transaction sends 0 ETH", "bright_green")
         try:
