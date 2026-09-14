@@ -24,7 +24,6 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from ranger_miner import CUDA_SOURCE as KECCAK_CUDA_SOURCE
 from ranger_miner import GPU as KeccakGPU
 from ranger_miner import RpcPool, n, word
 
@@ -49,16 +48,92 @@ GAS_LIMIT = 800_000
 MIN_PRIORITY_FEE = 20_000_000
 
 
-# ranger_miner has an optimized one-block Keccak-256 kernel. MNMNT's packed
-# payload is seed[32] || sender[20] || uint256 nonce[32], so the variable
-# low 64 nonce bits live in lanes 9/10 instead of lanes 5/6.
-CUDA_SOURCE = KECCAK_CUDA_SOURCE.replace(
-    " s[5]=((uint64_t)sw32(hi))<<32;\n s[6]=(s[6]&0xffffffff00000000ULL)|(uint64_t)sw32(lo);",
-    " s[9]=(s[9]&0x00000000ffffffffULL)|(((uint64_t)sw32(hi))<<32);\n"
-    " s[10]=(s[10]&0xffffffff00000000ULL)|(uint64_t)sw32(lo);",
+# Scalar-lane Keccak generator adapted from mosfick21/Cat. Unlike the older
+# generic kernel, all state indexes and rotations are compile-time constants,
+# so NVRTC can keep the permutation in registers instead of indexing arrays.
+KECCAK_RC = (
+    0x1, 0x8082, 0x800000000000808A, 0x8000000080008000,
+    0x808B, 0x80000001, 0x8000000080008081, 0x8000000000008009,
+    0x8A, 0x88, 0x80008009, 0x8000000A,
+    0x8000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x800A, 0x800000008000000A,
+    0x8000000080008081, 0x8000000000008080, 0x80000001, 0x8000000080008008,
 )
-if CUDA_SOURCE == KECCAK_CUDA_SOURCE:
-    raise RuntimeError("Could not configure MNMNT CUDA payload")
+KECCAK_RHO = (0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14)
+
+
+def make_cuda_source() -> str:
+    lines = [r"""
+typedef unsigned long long uint64_t;
+typedef unsigned int uint32_t;
+__device__ __forceinline__ uint64_t rol(uint64_t x,int n){return n?((x<<n)|(x>>(64-n))):x;}
+__device__ __forceinline__ uint32_t sw32(uint32_t x){return __byte_perm(x,0,0x0123);}
+__device__ __forceinline__ uint64_t bswap(uint64_t x){
+ x=((x&0x00ff00ff00ff00ffULL)<<8)|((x>>8)&0x00ff00ff00ff00ffULL);
+ x=((x&0x0000ffff0000ffffULL)<<16)|((x>>16)&0x0000ffff0000ffffULL);
+ return (x<<32)|(x>>32);
+}
+__device__ __forceinline__ void scalar64(const uint64_t* __restrict__ base,uint64_t nonce,uint32_t* out){
+"""]
+    lines.append("const uint64_t rc[24]={" + ",".join(hex(x) + "ULL" for x in KECCAK_RC) + "};")
+    lines.extend(f"uint64_t s{i}=" + (f"base[{i}];" if i < 17 else "0ULL;") for i in range(25))
+    lines.extend([
+        "uint64_t nn=bswap(nonce);",
+        "s9=(s9&0x00000000ffffffffULL)|(nn<<32);",
+        "s10=(s10&0xffffffff00000000ULL)|(nn>>32);",
+        "#pragma unroll 1",
+        "for(int r=0;r<24;r++){",
+    ])
+    for x in range(5):
+        lines.append(f"uint64_t c{x}=" + "^".join(f"s{x + 5*y}" for y in range(5)) + ";")
+    for x in range(5):
+        lines.append(f"uint64_t d{x}=c{(x + 4) % 5}^rol(c{(x + 1) % 5},1);")
+    for y in range(5):
+        for x in range(5):
+            source = x + 5 * y
+            dest = y + 5 * ((2 * x + 3 * y) % 5)
+            lines.append(f"uint64_t b{dest}=rol(s{source}^d{x},{KECCAK_RHO[source]});")
+    for y in range(5):
+        for x in range(5):
+            i = x + 5 * y
+            lines.append(f"s{i}=b{i}^((~b{(x + 1) % 5 + 5*y})&b{(x + 2) % 5 + 5*y});")
+    lines.extend(["s0^=rc[r];", "}"])
+    for i in range(4):
+        lines.extend([
+            f"uint64_t o{i}=bswap(s{i});",
+            f"out[{2*i}]=(uint32_t)(o{i}>>32);out[{2*i+1}]=(uint32_t)o{i};",
+        ])
+    lines.append("}")
+    lines.append(r"""
+__device__ __forceinline__ uint32_t zero_bits(const uint32_t*h){
+ uint32_t n=0;for(int i=0;i<8;i++){if(h[i]==0)n+=32;else{n+=__clz(h[i]);break;}}return n;
+}
+__device__ __forceinline__ bool below(const uint32_t*h,const uint32_t*t){
+ for(int i=0;i<8;i++){if(h[i]<t[i])return true;if(h[i]>t[i])return false;}return false;
+}
+extern "C" __global__ void ranger_mine(const uint64_t*base,const uint32_t*target,
+ uint32_t slo,uint32_t shi,uint32_t iters,uint32_t*found,uint64_t*answer,
+ uint32_t*best,uint64_t*bestnonce){
+ uint64_t tid=(uint64_t)blockIdx.x*blockDim.x+threadIdx.x;
+ uint64_t stride=(uint64_t)gridDim.x*blockDim.x;
+ uint64_t start=((uint64_t)shi<<32)|slo;
+ uint32_t local=0;uint64_t localnonce=start+tid;
+ for(uint32_t i=0;i<iters;i++){
+  if((i&15u)==0u && __ldg(found))break;
+  uint64_t nonce=start+tid+(uint64_t)i*stride;uint32_t h[8];scalar64(base,nonce,h);
+  uint32_t z=zero_bits(h);if(z>local){local=z;localnonce=nonce;}
+  if(below(h,target)){if(atomicCAS(found,0u,1u)==0u)*answer=nonce;break;}
+ }
+ uint32_t old=atomicMax(best,local);if(local>old)*bestnonce=localnonce;
+}
+extern "C" __global__ void ranger_hash_one(const uint64_t*base,uint32_t lo,uint32_t hi,uint32_t*out){
+ if(blockIdx.x||threadIdx.x)return;scalar64(base,((uint64_t)hi<<32)|lo,out);
+}
+""")
+    return "\n".join(lines)
+
+
+CUDA_SOURCE = make_cuda_source()
 
 
 @dataclass
